@@ -1,0 +1,8 @@
+output/
+old/
+__pycache__/
+output-segmentation/
+output-detection/
+data/
+pretrained/
+*.egg-info/
