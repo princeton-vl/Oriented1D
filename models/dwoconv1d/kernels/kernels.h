@@ -64,10 +64,10 @@ T const& constexpr_max(T const& a, T const& b) {
 
 template<typename T, int S_, int Sb_, int STR_>
 struct GeneralFpropParams {
-    static constexpr const int STR = STR_, S = S_, Sb = Sb_, SS = (S+Sb-1)/Sb;
+    static constexpr const int STR = STR_, S = S_, Sb = Sb_, SS = (S+Sb-1)/Sb; // S = kernel size, SS = split kernel into smaller partitions to reduce GPU shared memory usage
     static constexpr const ConvOperation OPS = ConvOperation::FPROP;
-    static constexpr const int WARP = 32, K = sizeof(float4) / sizeof(T); 
-    static constexpr const int L = 4;
+    static constexpr const int WARP = 32, K = sizeof(float4) / sizeof(T);  // K = numbers of bytes read per read operation (K=4 does 128bit vectorized reads vs 32bit for K=1) 
+    static constexpr const int L = 4; // number of dst outputs to compute per thread
     
     T *theta;
     int N, C, H, W, P, Q, PAD,HW, PQ, RS;
@@ -85,26 +85,28 @@ struct GeneralFpropParams {
     }
 
     CUTLASS_HOST_DEVICE void compute_params() {
+        // constants required to compute the cuda kernel
         DST_H = P;
         DST_W = Q;
         SRC_H = H;
         SRC_W = W;
         DST_HW = DST_H*DST_W;
         SRC_HW = SRC_H*SRC_W;
-        N_THREADS = max(min(STR*int(constexpr_sqrt((SRC_HW+WARP*K-1)/(WARP*K)))*WARP, 256), 32);
-        N_BLOCKS = max((DST_HW+L*N_THREADS-1)/(L*N_THREADS), 1);
-        BLOCK_H = min(SS+(N_THREADS*L*STR+DST_W-1)/DST_W, SRC_H);
-        BLOCK_HW = BLOCK_H*SRC_W + (((SRC_W%K) == 0) ? 0 : K);
+        // the following constants are obtained through heuristics and manual tuning - get best compromise between speed of execution and shared memory usage
+        N_THREADS = max(min(STR*int(constexpr_sqrt((SRC_HW+WARP*K-1)/(WARP*K)))*WARP, 256), 32); // heuristic - seems to work well across input sizes
+        N_BLOCKS = max((DST_HW+L*N_THREADS-1)/(L*N_THREADS), 1); // number of vertical bands = output size / (number of outputs computed in a threadblock)
+        BLOCK_H = min(SS+(N_THREADS*L*STR+DST_W-1)/DST_W, SRC_H); // height of a vertical band. we add padding (=SS) because we need to read extra data to account for a rotated convolution. 
+        BLOCK_HW = BLOCK_H*SRC_W + (((SRC_W%K) == 0) ? 0 : K); // size of shared memory reserved for reading the input in a threadblock. we need to make it 128-bit aligned (for K=4) to support vectorized reads.  
     }
 
     CUTLASS_HOST_DEVICE dim3 compute_grid_size() const {
-        return dim3(N_BLOCKS, N, C);
+        return dim3(N_BLOCKS, N, C); // repeat the kernel for every vertical band of an image, every channel and batches of the input
     }
     CUTLASS_HOST_DEVICE dim3 compute_block_size() const {
-        return dim3(N_THREADS, 1, 1);
+        return dim3(N_THREADS, 1, 1); // number of threads in a threadblock. 
     }
     CUTLASS_HOST_DEVICE int shared_mem() const {
-        return BLOCK_HW + SS*Sb;
+        return BLOCK_HW + SS*Sb; // shared memory for the input and the kernel / filter.
     }
 };
 
@@ -198,7 +200,7 @@ struct GeneralWgradParams {
         return dim3(N_THREADS, 1, 1);
     }
     CUTLASS_HOST_DEVICE int shared_mem() const {
-        return BLOCK_HW + BLOCK_PQ + N_WARPS*RS*LL;
+        return BLOCK_HWT + BLOCK_PQ + N_WARPS*RS*LL;
     }
 };
 
@@ -209,42 +211,55 @@ static __global__ void general_fprop_kernel(Element* dst, Element* flt, Element*
             c   = blockIdx.z,
             nc  = n*params.C+c;
 
-    dst = dst + (nc * params.DST_HW); 
-    src = src + (nc * params.SRC_HW);
-    flt = flt + ( c * params.RS);
+    // Make it look like we are operating on one image, with only one channel and one batch
+    dst = dst + (nc * params.DST_HW); // offset dst by the appropriate channel and batch 
+    src = src + (nc * params.SRC_HW); // same for src
+    flt = flt + ( c * params.RS); // same for flt
 
-    const int READ_SIZE = params.N_THREADS*Params::K, N_READS = (params.BLOCK_HW+READ_SIZE-1)/READ_SIZE;
+    // shared memory
+    extern __shared__ Element shared[];
+    Element *shared_src = shared, *shared_flt = shared + params.BLOCK_HW;
+    
+    // constants
+    // read_size = number_of_threads * data_read_per_thread; n_reads = size_of_shared_memory / read_size
+    const int READ_SIZE = params.N_THREADS*Params::K, N_READS = (params.BLOCK_HW+READ_SIZE-1)/READ_SIZE; 
+    // comp_size_per_vertical_band = number_of_threads * number_of_vertical_bands; n_comps = size_of_output / comp_size
     const int COMP_SIZE = params.N_THREADS*params.N_BLOCKS, N_COMPS = (params.DST_HW+COMP_SIZE-1)/COMP_SIZE;
     const int WARP_COMP_SIZE = Params::WARP*N_COMPS;
     const int BLOCK_COMP_SIZE = params.N_THREADS*N_COMPS;
-
-    extern __shared__ Element shared[];
-    Element *shared_src = shared, *shared_flt = shared + params.BLOCK_HW;
+    
+    const int cid = params.N_THREADS*blockIdx.x+threadIdx.x; // computation index - (p,q) index in destination dst that the thread computes 
+    const int block_base_comp0 = (cid/params.N_THREADS)*BLOCK_COMP_SIZE;
+    const int rid = threadIdx.x; // read index
+    const int warp_base_read  = (rid/Params::WARP)*Params::WARP*N_READS*Params::K + (rid%Params::WARP)*Params::K; // current index of the input that is going to be read by the current thread
+    const int warp_base_read1 = (rid/Params::WARP+1)*Params::WARP*N_READS*Params::K; // last index of the input read by a thread in the warp 
+    const int warp_base_comp  = (cid/Params::WARP)*WARP_COMP_SIZE + (cid%Params::WARP); // current index of the input that is going to be read by the current thread
+    const int warp_base_comp1 = (cid/Params::WARP)*WARP_COMP_SIZE + WARP_COMP_SIZE; // last index of the output written by a thread in the warp
 
     float cos, sin;
     sincosf(params.angle(c), &sin, &cos);
 
-    const int cid = params.N_THREADS*blockIdx.x+threadIdx.x;
-    const int block_base_comp0 = (cid/params.N_THREADS)*BLOCK_COMP_SIZE;
-    const int rid = threadIdx.x;
-    const int warp_base_read  = (rid/Params::WARP)*Params::WARP*N_READS*Params::K + (rid%Params::WARP)*Params::K;
-    const int warp_base_read1 = (rid/Params::WARP+1)*Params::WARP*N_READS*Params::K;
-    const int warp_base_comp  = (cid/Params::WARP)*WARP_COMP_SIZE + (cid%Params::WARP); 
-    const int warp_base_comp1 = (cid/Params::WARP)*WARP_COMP_SIZE + WARP_COMP_SIZE;
-    
+    // read the kernel / filter into shared memory 
     if(rid < params.Sb*params.SS) shared_flt[rid] = (rid < params.S) ? flt[rid] : Element(0);
 
     CUTLASS_PRAGMA_UNROLL
     for(int ss = 0; ss < Params::S; ss+=Params::SS) {
-        const int base_h = max((block_base_comp0/params.DST_W)*Params::STR + min( int(-sin*(ss-params.PAD)),  int(-sin*(ss+Params::SS-1-params.PAD))),0);
-        const int base_hw = (base_h*params.SRC_W) - ((nc*params.SRC_HW+base_h*params.SRC_W)%Params::K);
+        // get height h from which to start reading the input - we need to read more rows to account for oriented convolutions 
+        const int base_h = max((block_base_comp0/params.DST_W)*Params::STR + min(int(-sin*(ss-params.PAD)), int(-sin*(ss+Params::SS-1-params.PAD))),0); 
+        const int base_hw = (base_h*params.SRC_W) - ((nc*params.SRC_HW+base_h*params.SRC_W)%Params::K); // computes offset from which to start reading src, include padding for vectorized reads 
 
+        // read the input into shared memory
+        // if all N_READS read operations in the warp stay in bounds, read them without making out-of-bounds check -- faster  
+        // out-of-bounds reads are necessary to avoid making wrong computations (e.g. input should be 0) 
+        // shared_src[0:BLOCK_HW] will contain all elements from src[base_hw:base_hw+BLOCK_HW] 
         if(base_hw+warp_base_read1 <= params.SRC_HW && warp_base_read1 <= params.BLOCK_HW) {
             for(int i = 0; i < N_READS; i++) {
+                // NOTE: coalesced reads (very important for performance), stride of 32 (warp) not N_THREADS
                 const int hw = warp_base_read+i*Params::WARP*Params::K;
-                *reinterpret_cast<Vector*>(shared_src+hw) = *(reinterpret_cast<Vector*>(src+base_hw+hw));
+                *reinterpret_cast<Vector*>(shared_src+hw) = *(reinterpret_cast<Vector*>(src+base_hw+hw));  // make vectorized read
             }
         }
+        // otherwise make out-of-bounds check for every read
         else if(base_hw+warp_base_read < params.SRC_HW && warp_base_read < params.BLOCK_HW){
             for(int i = 0; i < N_READS; i++) {
                 const int hw = warp_base_read+i*Params::WARP*Params::K;
@@ -253,20 +268,30 @@ static __global__ void general_fprop_kernel(Element* dst, Element* flt, Element*
             }
         }
 
+        // sync shared memory to make all the data available to all threads in threadblock
         __syncthreads();
-    
+
+        // compute output
+        // computation will stay in-bounds
         if(warp_base_comp1 <= params.DST_HW) {
             for(int i = 0; i < N_COMPS; i++) {
                 const int pq = warp_base_comp + i*Params::WARP, h0 = pq/params.DST_W, w0 = pq%params.DST_W;
                 Element sum(0);
+                // unrolls are important to make computations fast
                 CUTLASS_PRAGMA_UNROLL
                 for(int s = 0; s < Params::SS; s++) {
+                    // NOTE: we are reading from shared memory -> efficient
+                    // compute indexes (h,w) from equation tying (h,w), (p,q) and (s, theta) together
                     const int h = h0*Params::STR+int(-sin*(ss+s-params.PAD)), w=w0*Params::STR+int(cos*(ss+s-params.PAD));
+                    // convolution: dot product between input and kernel / filter (with out-of-bounds)
                     sum += (h >= 0 && h < params.SRC_H && w >= 0 && w < params.SRC_W) ? shared_src[h*params.SRC_W+w-base_hw]*shared_flt[ss+s] : Element(0);
                 }
+                // NOTE: if SS < S, we're making multiple writes to dst. compromise shared memory usage (small SS) for higher number of global writes.
+                // NOTE: coalesced writes (very important for performance), stride of 32 (warp) not N_THREADS
                 dst[pq] = (ss == 0) ? sum : dst[pq] + sum;
             }
         }
+        // computation will go out-of-bounds
         else if(warp_base_comp < params.DST_HW){
             for(int i = 0; i < N_COMPS; i++) {
                 const int pq = warp_base_comp + i*Params::WARP, h0 = pq/params.DST_W, w0 = pq%params.DST_W;
